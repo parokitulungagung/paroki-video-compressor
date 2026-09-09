@@ -61,8 +61,8 @@ jobs:
           mkdir -p ~/.aws
           cat > ~/.aws/credentials <<EOF
           [r2]
-          aws_access_key_id = ${{ secrets.R2_ACCESS_KEY_WRITE }}
-          aws_secret_access_key = ${{ secrets.R2_SECRET_KEY_WRITE }}
+          aws_access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
           EOF
 
       - name: Scan staging & process every video, one by one
@@ -72,8 +72,8 @@ jobs:
           ALBUM: ${{ github.event.client_payload.album }}
           STAGING_PREFIX: ${{ github.event.client_payload.staging_prefix }}
           TARGET_PREFIX: ${{ github.event.client_payload.target_prefix }}
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          WEBHOOK_URL: ${{ secrets.VIDEO_CALLBACK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.VIDEO_WEBHOOK_SECRET }}
         run: |
           set -e
           echo "Album: $ALBUM"
