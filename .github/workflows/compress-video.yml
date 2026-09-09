@@ -35,10 +35,26 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Setup ffmpeg & aws-cli
+      - name: Setup ffmpeg & jq
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y ffmpeg awscli jq
+          sudo apt-get install -y ffmpeg jq
+
+      - name: Ensure AWS CLI is available
+        # ubuntu-latest (24.04 "noble") tidak lagi punya paket 'awscli' di
+        # apt (dihapus dari repo Ubuntu). Untungnya runner GitHub-hosted
+        # SUDAH datang dengan AWS CLI v2 preinstalled, jadi biasanya cukup
+        # dicek saja. Kalau suatu saat image runner berubah dan aws-cli
+        # ternyata tidak ada, baru diinstall lewat installer resmi (bukan
+        # apt) supaya tidak bergantung pada ketersediaan paket distro.
+        run: |
+          if ! command -v aws >/dev/null 2>&1; then
+            echo "aws-cli tidak ditemukan di runner, install manual via installer resmi..."
+            curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+          fi
+          aws --version
 
       - name: Configure R2 (S3-compatible) credentials
         run: |
