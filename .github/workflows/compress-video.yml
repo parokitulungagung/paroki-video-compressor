@@ -1,0 +1,94 @@
+name: Compress video for galeri foto
+
+# Dipicu dari admin/api/r2_folder_upload.php lewat GitHub API
+# "repository_dispatch" saat hosting/shared server tidak punya ffmpeg.
+on:
+  repository_dispatch:
+    types: [compress-video]
+
+jobs:
+  compress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      R2_ENDPOINT:   ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET:     ${{ secrets.R2_BUCKET }}
+      CALLBACK_URL:  ${{ secrets.VIDEO_CALLBACK_URL }}
+      WEBHOOK_SECRET: ${{ secrets.VIDEO_WEBHOOK_SECRET }}
+      STAGING_KEY: ${{ github.event.client_payload.staging_key }}
+      TARGET_KEY:  ${{ github.event.client_payload.target_key }}
+      POSTER_KEY:  ${{ github.event.client_payload.poster_key }}
+      ALBUM:       ${{ github.event.client_payload.album }}
+    steps:
+      - name: Konfigurasi AWS CLI untuk Cloudflare R2 (S3-compatible)
+        run: |
+          aws configure set aws_access_key_id "${{ secrets.R2_ACCESS_KEY_ID }}"
+          aws configure set aws_secret_access_key "${{ secrets.R2_SECRET_ACCESS_KEY }}"
+          aws configure set default.region auto
+
+      - name: Pastikan ffmpeg tersedia
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+
+      - name: Download video mentah dari staging R2
+        run: |
+          set -euo pipefail
+          EXT="${STAGING_KEY##*.}"
+          echo "IN_EXT=$EXT" >> "$GITHUB_ENV"
+          aws s3 cp "s3://${R2_BUCKET}/${STAGING_KEY}" "./input.${EXT}" \
+            --endpoint-url "${R2_ENDPOINT}"
+
+      - name: Transcode video (H.264 CRF 30, preset veryfast, maks 1080p, AAC 96k)
+        run: |
+          set -euo pipefail
+          OUT_EXT="${TARGET_KEY##*.}"
+          echo "OUT_EXT=$OUT_EXT" >> "$GITHUB_ENV"
+          ffmpeg -y -i "./input.${IN_EXT}" -map_metadata 0 \
+            -vf "scale=-2:'min(1080,ih)'" \
+            -c:v libx264 -crf 30 -preset veryfast -pix_fmt yuv420p -movflags +faststart \
+            -c:a aac -b:a 96k -loglevel error \
+            "./output.${OUT_EXT}"
+
+      - name: Ambil frame poster (detik ke-1) & konversi ke WebP
+        run: |
+          set -euo pipefail
+          ffmpeg -y -ss 00:00:01 -i "./output.${OUT_EXT}" -frames:v 1 \
+            -vf "scale=800:-2" -q:v 3 -loglevel error ./poster.jpg \
+            || ffmpeg -y -i "./output.${OUT_EXT}" -frames:v 1 \
+               -vf "scale=800:-2" -q:v 3 -loglevel error ./poster.jpg
+          ffmpeg -y -i ./poster.jpg -loglevel error ./poster.webp
+
+      - name: Upload hasil final ke R2 (video + poster)
+        run: |
+          set -euo pipefail
+          aws s3 cp "./output.${OUT_EXT}" "s3://${R2_BUCKET}/${TARGET_KEY}" \
+            --endpoint-url "${R2_ENDPOINT}" \
+            --content-type "video/${OUT_EXT/mov/quicktime}"
+          aws s3 cp "./poster.webp" "s3://${R2_BUCKET}/${POSTER_KEY}" \
+            --endpoint-url "${R2_ENDPOINT}" \
+            --content-type "image/webp"
+
+      - name: Hapus file staging (sudah tidak dipakai)
+        if: always()
+        run: |
+          aws s3 rm "s3://${R2_BUCKET}/${STAGING_KEY}" --endpoint-url "${R2_ENDPOINT}" || true
+
+      - name: Beritahu server (webhook) — selesai
+        if: success()
+        run: |
+          curl -sf -X POST "${CALLBACK_URL}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${WEBHOOK_SECRET}" \
+            -d "{\"album\":\"${ALBUM}\",\"target_key\":\"${TARGET_KEY}\",\"status\":\"done\"}"
+
+      - name: Beritahu server (webhook) — gagal
+        if: failure()
+        run: |
+          curl -sf -X POST "${CALLBACK_URL}" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${WEBHOOK_SECRET}" \
+            -d "{\"album\":\"${ALBUM}\",\"target_key\":\"${TARGET_KEY}\",\"status\":\"failed\",\"message\":\"Lihat log run GitHub Actions untuk detail.\"}"
