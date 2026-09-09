@@ -1,94 +1,140 @@
-name: Compress video for galeri foto
+name: Compress Video (Batch, Self-Discovery)
 
-# Dipicu dari admin/api/r2_folder_upload.php lewat GitHub API
-# "repository_dispatch" saat hosting/shared server tidak punya ffmpeg.
+# ─────────────────────────────────────────────────────────────────────────
+# Event 'compress-video-batch' — payload SELALU kecil (cuma nama album +
+# prefix), TIDAK berisi daftar file:
+#   {
+#     "album": "Misa Natal 2024",
+#     "staging_prefix": "_pending_video/Misa Natal 2024/",
+#     "target_prefix":  "galerifoto/Misa Natal 2024/"
+#   }
+#
+# Runner ini yang MEN-SCAN SENDIRI semua object di bawah staging_prefix
+# (aws s3api list-objects-v2), lalu ffmpeg memprosesnya SATU-PER-SATU secara
+# BERURUTAN dalam 1 job yang sama — itulah yang membuat 1 folder berisi N
+# video menghasilkan 1 run GitHub Actions, bukan N run terpisah, DAN hosting
+# tidak perlu tahu/mengirim daftar file video sama sekali (cukup upload
+# semua file dulu ke staging, lalu kirim sinyal nama album).
+#
+# Nama file di staging SUDAH memakai ekstensi FINAL (lihat
+# admin/api/r2_folder_upload.php sisi hosting: mp4/mov/m4v/mkv dipertahankan,
+# format lain dipaksa .mp4) — jadi key final = target_prefix + relpath
+# (relatif terhadap staging_prefix), TANPA workflow ini perlu tahu aturan
+# normalisasi ekstensi tsb sama sekali.
+# ─────────────────────────────────────────────────────────────────────────
+
 on:
   repository_dispatch:
-    types: [compress-video]
+    types: [compress-video-batch]
 
 jobs:
-  compress:
+  compress-batch:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      R2_ENDPOINT:   ${{ secrets.R2_ENDPOINT }}
-      R2_BUCKET:     ${{ secrets.R2_BUCKET }}
-      CALLBACK_URL:  ${{ secrets.VIDEO_CALLBACK_URL }}
-      WEBHOOK_SECRET: ${{ secrets.VIDEO_WEBHOOK_SECRET }}
-      STAGING_KEY: ${{ github.event.client_payload.staging_key }}
-      TARGET_KEY:  ${{ github.event.client_payload.target_key }}
-      POSTER_KEY:  ${{ github.event.client_payload.poster_key }}
-      ALBUM:       ${{ github.event.client_payload.album }}
+    # Naikkan kalau albummu bisa berisi puluhan video besar — semuanya
+    # diproses berurutan di 1 job ini, jadi totalnya bisa lama.
+    timeout-minutes: 350
+
     steps:
-      - name: Konfigurasi AWS CLI untuk Cloudflare R2 (S3-compatible)
+      - name: Setup ffmpeg & aws-cli
         run: |
-          aws configure set aws_access_key_id "${{ secrets.R2_ACCESS_KEY_ID }}"
-          aws configure set aws_secret_access_key "${{ secrets.R2_SECRET_ACCESS_KEY }}"
-          aws configure set default.region auto
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg awscli jq
 
-      - name: Pastikan ffmpeg tersedia
+      - name: Configure R2 (S3-compatible) credentials
         run: |
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y ffmpeg
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials <<EOF
+          [r2]
+          aws_access_key_id = ${{ secrets.R2_ACCESS_KEY_WRITE }}
+          aws_secret_access_key = ${{ secrets.R2_SECRET_KEY_WRITE }}
+          EOF
+
+      - name: Scan staging & process every video, one by one
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          ALBUM: ${{ github.event.client_payload.album }}
+          STAGING_PREFIX: ${{ github.event.client_payload.staging_prefix }}
+          TARGET_PREFIX: ${{ github.event.client_payload.target_prefix }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+        run: |
+          set -e
+          echo "Album: $ALBUM"
+          echo "Staging prefix: $STAGING_PREFIX"
+          echo "Target prefix:  $TARGET_PREFIX"
+
+          # ── 1) Scan sendiri semua object video pending untuk album ini ──
+          aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3api list-objects-v2 \
+            --bucket "$R2_BUCKET" --prefix "$STAGING_PREFIX" \
+            --query 'Contents[].Key' --output json > staging_keys.json
+
+          COUNT=$(jq 'length' staging_keys.json)
+          echo "Total video ditemukan di staging: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Tidak ada video pending untuk album ini, selesai."
+            exit 0
           fi
-          ffmpeg -version | head -n 1
 
-      - name: Download video mentah dari staging R2
-        run: |
-          set -euo pipefail
-          EXT="${STAGING_KEY##*.}"
-          echo "IN_EXT=$EXT" >> "$GITHUB_ENV"
-          aws s3 cp "s3://${R2_BUCKET}/${STAGING_KEY}" "./input.${EXT}" \
-            --endpoint-url "${R2_ENDPOINT}"
+          # ── 2) Proses satu-per-satu, BERURUTAN (bukan matrix/paralel) ──
+          for i in $(seq 0 $((COUNT - 1))); do
+            STAGING_KEY=$(jq -r ".[$i]" staging_keys.json)
+            RELPATH="${STAGING_KEY#"$STAGING_PREFIX"}"
+            TARGET_KEY="${TARGET_PREFIX}${RELPATH}"
+            POSTER_KEY="${TARGET_KEY}.poster.webp"
 
-      - name: Transcode video (H.264 CRF 30, preset veryfast, maks 1080p, AAC 96k)
-        run: |
-          set -euo pipefail
-          OUT_EXT="${TARGET_KEY##*.}"
-          echo "OUT_EXT=$OUT_EXT" >> "$GITHUB_ENV"
-          ffmpeg -y -i "./input.${IN_EXT}" -map_metadata 0 \
-            -vf "scale=-2:'min(1080,ih)'" \
-            -c:v libx264 -crf 30 -preset veryfast -pix_fmt yuv420p -movflags +faststart \
-            -c:a aac -b:a 96k -loglevel error \
-            "./output.${OUT_EXT}"
+            echo "── [$((i+1))/$COUNT] $STAGING_KEY → $TARGET_KEY ──"
 
-      - name: Ambil frame poster (detik ke-1) & konversi ke WebP
-        run: |
-          set -euo pipefail
-          ffmpeg -y -ss 00:00:01 -i "./output.${OUT_EXT}" -frames:v 1 \
-            -vf "scale=800:-2" -q:v 3 -loglevel error ./poster.jpg \
-            || ffmpeg -y -i "./output.${OUT_EXT}" -frames:v 1 \
-               -vf "scale=800:-2" -q:v 3 -loglevel error ./poster.jpg
-          ffmpeg -y -i ./poster.jpg -loglevel error ./poster.webp
+            SRC="/tmp/src_$i"
+            OUT="/tmp/out_$i.mp4"
+            POSTER="/tmp/poster_$i.webp"
+            STATUS="done"
+            MESSAGE=""
 
-      - name: Upload hasil final ke R2 (video + poster)
-        run: |
-          set -euo pipefail
-          aws s3 cp "./output.${OUT_EXT}" "s3://${R2_BUCKET}/${TARGET_KEY}" \
-            --endpoint-url "${R2_ENDPOINT}" \
-            --content-type "video/${OUT_EXT/mov/quicktime}"
-          aws s3 cp "./poster.webp" "s3://${R2_BUCKET}/${POSTER_KEY}" \
-            --endpoint-url "${R2_ENDPOINT}" \
-            --content-type "image/webp"
+            if aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
+                 "s3://$R2_BUCKET/$STAGING_KEY" "$SRC"; then
 
-      - name: Hapus file staging (sudah tidak dipakai)
-        if: always()
-        run: |
-          aws s3 rm "s3://${R2_BUCKET}/${STAGING_KEY}" --endpoint-url "${R2_ENDPOINT}" || true
+              # Kompresi + convert (samakan parameter dengan
+              # R2FolderCompressor::compressVideo() di sisi PHP kalau perlu).
+              if ffmpeg -y -i "$SRC" \
+                   -c:v libx264 -crf 26 -preset veryfast \
+                   -vf "scale='min(1920,iw)':-2" \
+                   -c:a aac -b:a 128k \
+                   -movflags +faststart \
+                   "$OUT"; then
 
-      - name: Beritahu server (webhook) — selesai
-        if: success()
-        run: |
-          curl -sf -X POST "${CALLBACK_URL}" \
-            -H "Content-Type: application/json" \
-            -H "X-Webhook-Secret: ${WEBHOOK_SECRET}" \
-            -d "{\"album\":\"${ALBUM}\",\"target_key\":\"${TARGET_KEY}\",\"status\":\"done\"}"
+                aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
+                  "$OUT" "s3://$R2_BUCKET/$TARGET_KEY" \
+                  --content-type "video/mp4"
 
-      - name: Beritahu server (webhook) — gagal
-        if: failure()
-        run: |
-          curl -sf -X POST "${CALLBACK_URL}" \
-            -H "Content-Type: application/json" \
-            -H "X-Webhook-Secret: ${WEBHOOK_SECRET}" \
-            -d "{\"album\":\"${ALBUM}\",\"target_key\":\"${TARGET_KEY}\",\"status\":\"failed\",\"message\":\"Lihat log run GitHub Actions untuk detail.\"}"
+                # Poster/thumbnail dari frame ~1 detik.
+                if ffmpeg -y -ss 00:00:01 -i "$OUT" -frames:v 1 \
+                     -vf "scale='min(720,iw)':-2" "$POSTER" 2>/dev/null; then
+                  aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
+                    "$POSTER" "s3://$R2_BUCKET/$POSTER_KEY" \
+                    --content-type "image/webp" || true
+                fi
+
+                # Staging sudah tidak dibutuhkan lagi — hapus.
+                aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 rm \
+                  "s3://$R2_BUCKET/$STAGING_KEY" || true
+              else
+                STATUS="failed"; MESSAGE="ffmpeg compress gagal"
+              fi
+            else
+              STATUS="failed"; MESSAGE="download staging gagal"
+            fi
+
+            # Lapor per-video ke callback PHP (endpoint TIDAK berubah — tetap
+            # dipanggil sekali per video, hanya bukan lagi per run terpisah).
+            curl -sf -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+              -d "$(jq -n --arg album "$ALBUM" --arg target "$TARGET_KEY" \
+                     --arg status "$STATUS" --arg message "$MESSAGE" \
+                     '{album:$album, target_key:$target, status:$status, message:$message}')" \
+              || echo "::warning::callback gagal untuk $TARGET_KEY"
+
+            rm -f "$SRC" "$OUT" "$POSTER"
+          done
