@@ -114,9 +114,9 @@ jobs:
               # Kompresi + convert (samakan parameter dengan
               # R2FolderCompressor::compressVideo() di sisi PHP kalau perlu).
               if ffmpeg -y -i "$SRC" \
-                   -c:v libx264 -crf 26 -preset veryfast \
-                   -vf "scale='min(1920,iw)':-2" \
-                   -c:a aac -b:a 128k \
+                   -c:v libx264 -crf 29 -preset veryfast \
+                   -vf "scale='min(854,iw)':'min(480,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2" \
+                   -c:a aac -b:a 96k \
                    -movflags +faststart \
                    "$OUT"; then
 
