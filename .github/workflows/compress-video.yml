@@ -1,28 +1,5 @@
 name: Compress Video (Batch, Self-Discovery)
 
-# ─────────────────────────────────────────────────────────────────────────
-# Event 'compress-video-batch' — payload SELALU kecil (cuma nama album +
-# prefix), TIDAK berisi daftar file:
-#   {
-#     "album": "Misa Natal 2024",
-#     "staging_prefix": "_pending_video/Misa Natal 2024/",
-#     "target_prefix":  "galerifoto/Misa Natal 2024/"
-#   }
-#
-# Runner ini yang MEN-SCAN SENDIRI semua object di bawah staging_prefix
-# (aws s3api list-objects-v2), lalu ffmpeg memprosesnya SATU-PER-SATU secara
-# BERURUTAN dalam 1 job yang sama — itulah yang membuat 1 folder berisi N
-# video menghasilkan 1 run GitHub Actions, bukan N run terpisah, DAN hosting
-# tidak perlu tahu/mengirim daftar file video sama sekali (cukup upload
-# semua file dulu ke staging, lalu kirim sinyal nama album).
-#
-# Nama file di staging SUDAH memakai ekstensi FINAL (lihat
-# admin/api/r2_folder_upload.php sisi hosting: mp4/mov/m4v/mkv dipertahankan,
-# format lain dipaksa .mp4) — jadi key final = target_prefix + relpath
-# (relatif terhadap staging_prefix), TANPA workflow ini perlu tahu aturan
-# normalisasi ekstensi tsb sama sekali.
-# ─────────────────────────────────────────────────────────────────────────
-
 on:
   repository_dispatch:
     types: [compress-video-batch]
