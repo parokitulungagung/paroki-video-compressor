@@ -7,8 +7,6 @@ on:
 jobs:
   compress-batch:
     runs-on: ubuntu-latest
-    # Naikkan kalau albummu bisa berisi puluhan video besar — semuanya
-    # diproses berurutan di 1 job ini, jadi totalnya bisa lama.
     timeout-minutes: 350
 
     steps:
@@ -18,12 +16,6 @@ jobs:
           sudo apt-get install -y ffmpeg jq
 
       - name: Ensure AWS CLI is available
-        # ubuntu-latest (24.04 "noble") tidak lagi punya paket 'awscli' di
-        # apt (dihapus dari repo Ubuntu). Untungnya runner GitHub-hosted
-        # SUDAH datang dengan AWS CLI v2 preinstalled, jadi biasanya cukup
-        # dicek saja. Kalau suatu saat image runner berubah dan aws-cli
-        # ternyata tidak ada, baru diinstall lewat installer resmi (bukan
-        # apt) supaya tidak bergantung pada ketersediaan paket distro.
         run: |
           if ! command -v aws >/dev/null 2>&1; then
             echo "aws-cli tidak ditemukan di runner, install manual via installer resmi..."
@@ -49,8 +41,6 @@ jobs:
           ALBUM: ${{ github.event.client_payload.album }}
           STAGING_PREFIX: ${{ github.event.client_payload.staging_prefix }}
           TARGET_PREFIX: ${{ github.event.client_payload.target_prefix }}
-          WEBHOOK_URL: ${{ secrets.VIDEO_CALLBACK_URL }}
-          WEBHOOK_SECRET: ${{ secrets.VIDEO_WEBHOOK_SECRET }}
         run: |
           set -e
           echo "Album: $ALBUM"
@@ -70,7 +60,7 @@ jobs:
             exit 0
           fi
 
-          # ── 2) Proses satu-per-satu, BERURUTAN (bukan matrix/paralel) ──
+          # ── 2) Proses satu-per-satu, BERURUTAN ──
           for i in $(seq 0 $((COUNT - 1))); do
             STAGING_KEY=$(jq -r ".[$i]" staging_keys.json)
             RELPATH="${STAGING_KEY#"$STAGING_PREFIX"}"
@@ -82,18 +72,15 @@ jobs:
             SRC="/tmp/src_$i"
             OUT="/tmp/out_$i.mp4"
             POSTER="/tmp/poster_$i.webp"
-            STATUS="done"
-            MESSAGE=""
 
             if aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
                  "s3://$R2_BUCKET/$STAGING_KEY" "$SRC"; then
 
-              # Kompresi + convert (samakan parameter dengan
-              # R2FolderCompressor::compressVideo() di sisi PHP kalau perlu).
+              # Kompresi + convert ke 720p HD
               if ffmpeg -y -i "$SRC" \
-                   -c:v libx264 -crf 29 -preset veryfast \
-                   -vf "scale='min(854,iw)':'min(480,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2" \
-                   -c:a aac -b:a 96k \
+                   -c:v libx264 -crf 26 -preset veryfast \
+                   -vf "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2" \
+                   -c:a aac -b:a 128k \
                    -movflags +faststart \
                    "$OUT"; then
 
@@ -101,33 +88,25 @@ jobs:
                   "$OUT" "s3://$R2_BUCKET/$TARGET_KEY" \
                   --content-type "video/mp4"
 
-                # Poster/thumbnail dari frame ~1 detik.
+                # Poster/thumbnail dari frame ~1 detik
                 if ffmpeg -y -ss 00:00:01 -i "$OUT" -frames:v 1 \
-                     -vf "scale='min(720,iw)':-2" "$POSTER" 2>/dev/null; then
+                     -vf "scale='min(1280,iw)':-2" "$POSTER" 2>/dev/null; then
                   aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
                     "$POSTER" "s3://$R2_BUCKET/$POSTER_KEY" \
                     --content-type "image/webp" || true
                 fi
 
-                # Staging sudah tidak dibutuhkan lagi — hapus.
+                # Hapus dari staging setelah sukses
                 aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 rm \
                   "s3://$R2_BUCKET/$STAGING_KEY" || true
+                
+                echo "✓ Berhasil diproses: $TARGET_KEY"
               else
-                STATUS="failed"; MESSAGE="ffmpeg compress gagal"
+                echo "❌ Gagal: ffmpeg compress error pada $STAGING_KEY"
               fi
             else
-              STATUS="failed"; MESSAGE="download staging gagal"
+              echo "❌ Gagal: Download dari staging error pada $STAGING_KEY"
             fi
-
-            # Lapor per-video ke callback PHP (endpoint TIDAK berubah — tetap
-            # dipanggil sekali per video, hanya bukan lagi per run terpisah).
-            curl -sf -X POST "$WEBHOOK_URL" \
-              -H "Content-Type: application/json" \
-              -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
-              -d "$(jq -n --arg album "$ALBUM" --arg target "$TARGET_KEY" \
-                     --arg status "$STATUS" --arg message "$MESSAGE" \
-                     '{album:$album, target_key:$target, status:$status, message:$message}')" \
-              || echo "::warning::callback gagal untuk $TARGET_KEY"
 
             rm -f "$SRC" "$OUT" "$POSTER"
           done
