@@ -4,11 +4,6 @@ on:
   repository_dispatch:
     types: [compress-video-batch]
 
-concurrency:
-  # Cegah 2 job jalan bersamaan untuk album yang sama (hindari race condition di staging)
-  group: compress-video-${{ github.event.client_payload.album }}
-  cancel-in-progress: false
-
 jobs:
   compress-batch:
     runs-on: ubuntu-latest
@@ -17,32 +12,30 @@ jobs:
     steps:
       - name: Setup ffmpeg & jq
         run: |
-          set -e
-          # jq biasanya sudah ada di runner ubuntu-latest, tapi tetap dicek
-          if ! command -v jq >/dev/null 2>&1 || ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get update -y
-            sudo apt-get install -y --no-install-recommends ffmpeg jq
-          fi
-          ffmpeg -version | head -n1
-          jq --version
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg jq
 
       - name: Ensure AWS CLI is available
         run: |
-          set -e
           if ! command -v aws >/dev/null 2>&1; then
             echo "aws-cli tidak ditemukan di runner, install manual via installer resmi..."
             curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
             unzip -q awscliv2.zip
             sudo ./aws/install
-            rm -rf awscliv2.zip aws/
           fi
           aws --version
 
+      - name: Configure R2 (S3-compatible) credentials
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials <<EOF
+          [r2]
+          aws_access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          EOF
+
       - name: Scan staging & process every video, one by one
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           ALBUM: ${{ github.event.client_payload.album }}
@@ -50,38 +43,13 @@ jobs:
           TARGET_PREFIX: ${{ github.event.client_payload.target_prefix }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
         run: |
-          set -euo pipefail
-
-          if [ -z "$ALBUM" ] || [ -z "$STAGING_PREFIX" ] || [ -z "$TARGET_PREFIX" ]; then
-            echo "##[error]ALBUM / STAGING_PREFIX / TARGET_PREFIX kosong, batalkan."
-            exit 1
-          fi
-
+          set -e
           echo "Album: $ALBUM"
           echo "Staging prefix: $STAGING_PREFIX"
           echo "Target prefix:  $TARGET_PREFIX"
 
-          AWS="aws --endpoint-url $R2_ENDPOINT"
-
-          # Bersihkan file sementara otomatis, apa pun yang terjadi (sukses/gagal/dibatalkan)
-          cleanup() { rm -f /tmp/src_* /tmp/out_* /tmp/poster_* staging_keys.json; }
-          trap cleanup EXIT
-
-          # Fungsi retry generik: coba ulang perintah sampai 3x kalau gagal (mis. hiccup jaringan)
-          retry() {
-            local n=0 max=3 delay=5
-            until "$@"; do
-              n=$((n + 1))
-              if [ "$n" -ge "$max" ]; then
-                return 1
-              fi
-              echo "  ...gagal, retry ($n/$max) dalam ${delay}s"
-              sleep "$delay"
-            done
-          }
-
           # ── 1) Scan sendiri semua object video pending untuk album ini ──
-          $AWS s3api list-objects-v2 \
+          aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3api list-objects-v2 \
             --bucket "$R2_BUCKET" --prefix "$STAGING_PREFIX" \
             --query 'Contents[].Key' --output json > staging_keys.json
 
@@ -93,27 +61,24 @@ jobs:
             exit 0
           fi
 
-          OK=0
-          FAIL=0
-
           # ── 2) Proses satu-per-satu, BERURUTAN ──
           for i in $(seq 0 $((COUNT - 1))); do
-            STAGING_KEY=$(jq -r ".[$i]" staging_keys.json)
+            STAGING_KEY=*** -r ".[$i]" staging_keys.json)
             RELPATH="${STAGING_KEY#"$STAGING_PREFIX"}"
-            TARGET_KEY="${TARGET_PREFIX}${RELPATH}"
-            POSTER_KEY="${TARGET_KEY%.*}.webp"
+            TARGET_KEY="***"
+            POSTER_KEY="***"
 
-            echo "── [$((i + 1))/$COUNT] $STAGING_KEY → $TARGET_KEY ──"
+            echo "── [$((i+1))/$COUNT] $STAGING_KEY → $TARGET_KEY ──"
 
             SRC="/tmp/src_$i"
             OUT="/tmp/out_$i.mp4"
             POSTER="/tmp/poster_$i.webp"
 
-            if retry $AWS s3 cp --only-show-errors \
+            if aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
                  "s3://$R2_BUCKET/$STAGING_KEY" "$SRC"; then
 
               # Kompresi: 540p, CRF 29, preset slow, capped bitrate <850k (file kecil & jernih)
-              if ffmpeg -y -hide_banner -loglevel error -i "$SRC" \
+              if ffmpeg -y -i "$SRC" \
                    -c:v libx264 -crf 29 -preset slow \
                    -maxrate 850k -bufsize 1700k \
                    -pix_fmt yuv420p \
@@ -122,58 +87,39 @@ jobs:
                    -movflags +faststart \
                    "$OUT"; then
 
-                if retry $AWS s3 cp --only-show-errors \
-                     "$OUT" "s3://$R2_BUCKET/$TARGET_KEY" \
-                     --content-type "video/mp4"; then
+                aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
+                  "$OUT" "s3://$R2_BUCKET/$TARGET_KEY" \
+                  --content-type "video/mp4"
 
-                  # Poster/thumbnail dari frame ~1 detik
-                  if ffmpeg -y -hide_banner -loglevel error -ss 00:00:01 -i "$OUT" -frames:v 1 \
-                       -vf "scale='min(960,iw)':-2" "$POSTER"; then
-                    retry $AWS s3 cp --only-show-errors \
-                      "$POSTER" "s3://$R2_BUCKET/$POSTER_KEY" \
-                      --content-type "image/webp" || echo "  ⚠ Poster gagal diupload, dilanjut tanpa poster."
-                  else
-                    echo "  ⚠ Gagal membuat poster, dilanjut tanpa poster."
-                  fi
-
-                  # Hapus dari staging setelah sukses
-                  retry $AWS s3 rm "s3://$R2_BUCKET/$STAGING_KEY" || \
-                    echo "  ⚠ Gagal hapus dari staging (video sudah kepindah ke target)."
-
-                  echo "✓ Berhasil diproses: $TARGET_KEY"
-                  OK=$((OK + 1))
-
-                  # ── Callback otomatis ke website (Invalidasi Cache Album) ──
-                  if [ -n "${WEBHOOK_SECRET:-}" ]; then
-                    echo "Mengirim callback webhook ke website..."
-                    retry curl -fsS -X POST https://parokitulungagung.org/admin/api/r2_video_job_callback.php \
-                      -H "Content-Type: application/json" \
-                      -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
-                      -d "{\"album\":\"$ALBUM\",\"target_key\":\"$TARGET_KEY\",\"status\":\"done\"}" \
-                      || echo "  ⚠ Callback webhook gagal (tidak fatal)."
-                  fi
-
-                else
-                  echo "❌ Gagal: upload hasil kompresi ke target untuk $STAGING_KEY"
-                  FAIL=$((FAIL + 1))
+                # Poster/thumbnail dari frame ~1 detik
+                if ffmpeg -y -ss 00:00:01 -i "$OUT" -frames:v 1 \
+                     -vf "scale='min(960,iw)':-2" "$POSTER" 2>/dev/null; then
+                  aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
+                    "$POSTER" "s3://$R2_BUCKET/$POSTER_KEY" \
+                    --content-type "image/webp" || true
                 fi
+
+                # Hapus dari staging setelah sukses
+                aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 rm \
+                  "s3://$R2_BUCKET/$STAGING_KEY" || true
+
+                echo "✓ Berhasil diproses: $TARGET_KEY"
+
+                # ── Callback otomatis ke website (Invalidasi Cache Album) ──
+                if [ -n "$WEBHOOK_SECRET" ]; then
+                  echo "Mengirim callback webhook ke website..."
+                  curl -s -X POST https://parokitulungagung.org/admin/api/r2_video_job_callback.php \
+                    -H "Content-Type: application/json" \
+                    -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+                    -d "{\"album\":\"$ALBUM\",\"target_key\":\"$TARGET_KEY\",\"status\":\"done\"}" || true
+                fi
+
               else
                 echo "❌ Gagal: ffmpeg compress error pada $STAGING_KEY"
-                FAIL=$((FAIL + 1))
               fi
             else
               echo "❌ Gagal: Download dari staging error pada $STAGING_KEY"
-              FAIL=$((FAIL + 1))
             fi
 
             rm -f "$SRC" "$OUT" "$POSTER"
           done
-
-          echo ""
-          echo "════════════════════════════════════"
-          echo " Ringkasan: $OK berhasil, $FAIL gagal, dari total $COUNT video."
-          echo "════════════════════════════════════"
-
-          if [ "$FAIL" -gt 0 ]; then
-            exit 1
-          fi
