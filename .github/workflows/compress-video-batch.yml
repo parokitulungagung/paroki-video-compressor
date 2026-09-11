@@ -1,0 +1,112 @@
+name: Compress Video (Batch, Self-Discovery)
+
+on:
+  repository_dispatch:
+    types: [compress-video-batch]
+
+jobs:
+  compress-batch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Setup ffmpeg & jq
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg jq
+
+      - name: Ensure AWS CLI is available
+        run: |
+          if ! command -v aws >/dev/null 2>&1; then
+            echo "aws-cli tidak ditemukan di runner, install manual via installer resmi..."
+            curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+            unzip -q awscliv2.zip
+            sudo ./aws/install
+          fi
+          aws --version
+
+      - name: Configure R2 (S3-compatible) credentials
+        run: |
+          mkdir -p ~/.aws
+          cat > ~/.aws/credentials <<EOF
+          [r2]
+          aws_access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          aws_secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          EOF
+
+      - name: Scan staging & process every video, one by one
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          ALBUM: ${{ github.event.client_payload.album }}
+          STAGING_PREFIX: ${{ github.event.client_payload.staging_prefix }}
+          TARGET_PREFIX: ${{ github.event.client_payload.target_prefix }}
+        run: |
+          set -e
+          echo "Album: $ALBUM"
+          echo "Staging prefix: $STAGING_PREFIX"
+          echo "Target prefix:  $TARGET_PREFIX"
+
+          # ── 1) Scan sendiri semua object video pending untuk album ini ──
+          aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3api list-objects-v2 \
+            --bucket "$R2_BUCKET" --prefix "$STAGING_PREFIX" \
+            --query 'Contents[].Key' --output json > staging_keys.json
+
+          COUNT=$(jq 'length' staging_keys.json)
+          echo "Total video ditemukan di staging: $COUNT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Tidak ada video pending untuk album ini, selesai."
+            exit 0
+          fi
+
+          # ── 2) Proses satu-per-satu, BERURUTAN ──
+          for i in $(seq 0 $((COUNT - 1))); do
+            STAGING_KEY=$(jq -r ".[$i]" staging_keys.json)
+            RELPATH="${STAGING_KEY#"$STAGING_PREFIX"}"
+            TARGET_KEY="${TARGET_PREFIX}${RELPATH}"
+            POSTER_KEY="${TARGET_KEY}.poster.webp"
+
+            echo "── [$((i+1))/$COUNT] $STAGING_KEY → $TARGET_KEY ──"
+
+            SRC="/tmp/src_$i"
+            OUT="/tmp/out_$i.mp4"
+            POSTER="/tmp/poster_$i.webp"
+
+            if aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
+                 "s3://$R2_BUCKET/$STAGING_KEY" "$SRC"; then
+
+              # Kompresi + convert ke 540p, CRF lebih agresif, preset lebih efisien
+              if ffmpeg -y -i "$SRC" \
+                   -c:v libx264 -crf 29 -preset slower \
+                   -vf "scale='min(960,iw)':'min(540,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2" \
+                   -c:a aac -b:a 96k -ac 2 \
+                   -movflags +faststart \
+                   "$OUT"; then
+
+                aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
+                  "$OUT" "s3://$R2_BUCKET/$TARGET_KEY" \
+                  --content-type "video/mp4"
+
+                # Poster/thumbnail dari frame ~1 detik
+                if ffmpeg -y -ss 00:00:01 -i "$OUT" -frames:v 1 \
+                     -vf "scale='min(960,iw)':-2" "$POSTER" 2>/dev/null; then
+                  aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
+                    "$POSTER" "s3://$R2_BUCKET/$POSTER_KEY" \
+                    --content-type "image/webp" || true
+                fi
+
+                # Hapus dari staging setelah sukses
+                aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 rm \
+                  "s3://$R2_BUCKET/$STAGING_KEY" || true
+
+                echo "✓ Berhasil diproses: $TARGET_KEY"
+              else
+                echo "❌ Gagal: ffmpeg compress error pada $STAGING_KEY"
+              fi
+            else
+              echo "❌ Gagal: Download dari staging error pada $STAGING_KEY"
+            fi
+
+            rm -f "$SRC" "$OUT" "$POSTER"
+          done
