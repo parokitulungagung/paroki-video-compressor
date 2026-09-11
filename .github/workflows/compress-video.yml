@@ -76,11 +76,11 @@ jobs:
             if aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
                  "s3://$R2_BUCKET/$STAGING_KEY" "$SRC"; then
 
-              # Kompresi + convert ke 720p HD
+              # Kompresi + convert ke 540p, CRF lebih agresif, preset lebih efisien
               if ffmpeg -y -i "$SRC" \
-                   -c:v libx264 -crf 26 -preset veryfast \
-                   -vf "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2" \
-                   -c:a aac -b:a 128k \
+                   -c:v libx264 -crf 29 -preset slower \
+                   -vf "scale='min(960,iw)':'min(540,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2" \
+                   -c:a aac -b:a 96k -ac 2 \
                    -movflags +faststart \
                    "$OUT"; then
 
@@ -90,7 +90,7 @@ jobs:
 
                 # Poster/thumbnail dari frame ~1 detik
                 if ffmpeg -y -ss 00:00:01 -i "$OUT" -frames:v 1 \
-                     -vf "scale='min(1280,iw)':-2" "$POSTER" 2>/dev/null; then
+                     -vf "scale='min(960,iw)':-2" "$POSTER" 2>/dev/null; then
                   aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
                     "$POSTER" "s3://$R2_BUCKET/$POSTER_KEY" \
                     --content-type "image/webp" || true
@@ -99,7 +99,7 @@ jobs:
                 # Hapus dari staging setelah sukses
                 aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 rm \
                   "s3://$R2_BUCKET/$STAGING_KEY" || true
-                
+
                 echo "✓ Berhasil diproses: $TARGET_KEY"
               else
                 echo "❌ Gagal: ffmpeg compress error pada $STAGING_KEY"
