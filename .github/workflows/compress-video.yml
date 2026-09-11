@@ -41,6 +41,7 @@ jobs:
           ALBUM: ${{ github.event.client_payload.album }}
           STAGING_PREFIX: ${{ github.event.client_payload.staging_prefix }}
           TARGET_PREFIX: ${{ github.event.client_payload.target_prefix }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
         run: |
           set -e
           echo "Album: $ALBUM"
@@ -62,10 +63,10 @@ jobs:
 
           # ── 2) Proses satu-per-satu, BERURUTAN ──
           for i in $(seq 0 $((COUNT - 1))); do
-            STAGING_KEY=$(jq -r ".[$i]" staging_keys.json)
+            STAGING_KEY=*** -r ".[$i]" staging_keys.json)
             RELPATH="${STAGING_KEY#"$STAGING_PREFIX"}"
-            TARGET_KEY="${TARGET_PREFIX}${RELPATH}"
-            POSTER_KEY="${TARGET_KEY}.poster.webp"
+            TARGET_KEY="***"
+            POSTER_KEY="***"
 
             echo "── [$((i+1))/$COUNT] $STAGING_KEY → $TARGET_KEY ──"
 
@@ -76,11 +77,13 @@ jobs:
             if aws --endpoint-url "$R2_ENDPOINT" --profile r2 s3 cp \
                  "s3://$R2_BUCKET/$STAGING_KEY" "$SRC"; then
 
-              # Kompresi + convert ke 540p, CRF lebih agresif, preset lebih efisien
+              # Kompresi: 540p, CRF 29, preset slow, capped bitrate <850k (file kecil & jernih)
               if ffmpeg -y -i "$SRC" \
-                   -c:v libx264 -crf 29 -preset slower \
+                   -c:v libx264 -crf 29 -preset slow \
+                   -maxrate 850k -bufsize 1700k \
+                   -pix_fmt yuv420p \
                    -vf "scale='min(960,iw)':'min(540,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2" \
-                   -c:a aac -b:a 96k -ac 2 \
+                   -c:a aac -b:a 64k -ac 1 \
                    -movflags +faststart \
                    "$OUT"; then
 
@@ -101,6 +104,16 @@ jobs:
                   "s3://$R2_BUCKET/$STAGING_KEY" || true
 
                 echo "✓ Berhasil diproses: $TARGET_KEY"
+
+                # ── Callback otomatis ke website (Invalidasi Cache Album) ──
+                if [ -n "$WEBHOOK_SECRET" ]; then
+                  echo "Mengirim callback webhook ke website..."
+                  curl -s -X POST https://parokitulungagung.org/admin/api/r2_video_job_callback.php \
+                    -H "Content-Type: application/json" \
+                    -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+                    -d "{\"album\":\"$ALBUM\",\"target_key\":\"$TARGET_KEY\",\"status\":\"done\"}" || true
+                fi
+
               else
                 echo "❌ Gagal: ffmpeg compress error pada $STAGING_KEY"
               fi
