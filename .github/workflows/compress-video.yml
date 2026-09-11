@@ -173,9 +173,10 @@ jobs:
                   # ── Callback otomatis ke website (Invalidasi Cache Album) ──
                   if [ -n "${WEBHOOK_SECRET:-}" ]; then
                     echo "Mengirim callback webhook ke website..."
-                    retry curl -fsS -X POST https://parokitulungagung.org/admin/api/r2_video_job_callback.php \
+                    retry curl -fsS -L -X POST "https://www.parokitulungagung.org/r2-video-webhook.php?token=$WEBHOOK_SECRET" \
                       -H "Content-Type: application/json" \
                       -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+                      -A "ParokiTulungagung-VideoWebhook/1.0" \
                       -d "{\"album\":\"$ALBUM\",\"target_key\":\"$TARGET_KEY\",\"status\":\"done\"}" \
                       || echo "  ⚠ Callback webhook gagal (tidak fatal)."
                   fi
