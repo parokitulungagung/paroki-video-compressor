@@ -64,7 +64,7 @@ jobs:
           AWS="aws --endpoint-url $R2_ENDPOINT"
 
           # Bersihkan file sementara otomatis, apa pun yang terjadi (sukses/gagal/dibatalkan)
-          cleanup() { rm -f /tmp/src_* /tmp/out_* /tmp/poster_* staging_keys.json; }
+          cleanup() { rm -f /tmp/src_* /tmp/out_* /tmp/poster_* /tmp/webhook_body_* staging_keys.json; }
           trap cleanup EXIT
 
           # Fungsi retry generik: coba ulang perintah sampai 3x kalau gagal (mis. hiccup jaringan)
@@ -105,6 +105,34 @@ jobs:
             local rc=$?
             rm -f "$logfile"
             return $rc
+          }
+
+          # Kirim callback webhook, PLUS log http_code & body kalau gagal (untuk debugging 403/WAF/dsb).
+          # Return 0 kalau http_code == 200, selain itu return 1 (dipakai oleh retry()).
+          send_webhook() {
+            local target_key="$1"
+            local body_file
+            body_file=$(mktemp /tmp/webhook_body_XXXX)
+
+            local http_code
+            http_code=$(curl -sS -L -X POST \
+              "https://www.parokitulungagung.org/r2-video-webhook.php" \
+              -H "Content-Type: application/json" \
+              -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
+              -A "ParokiTulungagung-VideoWebhook/1.0" \
+              -d "{\"album\":\"$ALBUM\",\"target_key\":\"$target_key\",\"status\":\"done\"}" \
+              -o "$body_file" -w "%{http_code}") || true
+
+            if [ "$http_code" = "200" ]; then
+              rm -f "$body_file"
+              return 0
+            fi
+
+            echo "  ⚠ Webhook HTTP $http_code. Response body (maks 500 char):"
+            head -c 500 "$body_file"
+            echo ""
+            rm -f "$body_file"
+            return 1
           }
 
           # ── 1) Scan sendiri semua object video pending untuk album ini ──
@@ -173,12 +201,11 @@ jobs:
                   # ── Callback otomatis ke website (Invalidasi Cache Album) ──
                   if [ -n "${WEBHOOK_SECRET:-}" ]; then
                     echo "Mengirim callback webhook ke website..."
-                    retry curl -fsS -L -X POST "https://www.parokitulungagung.org/r2-video-webhook.php?token=$WEBHOOK_SECRET" \
-                      -H "Content-Type: application/json" \
-                      -H "X-Webhook-Secret: $WEBHOOK_SECRET" \
-                      -A "ParokiTulungagung-VideoWebhook/1.0" \
-                      -d "{\"album\":\"$ALBUM\",\"target_key\":\"$TARGET_KEY\",\"status\":\"done\"}" \
-                      || echo "  ⚠ Callback webhook gagal (tidak fatal)."
+                    if retry send_webhook "$TARGET_KEY"; then
+                      echo "  ✓ Callback berhasil."
+                    else
+                      echo "  ⚠ Callback webhook gagal (tidak fatal)."
+                    fi
                   fi
 
                 else
